@@ -14,25 +14,21 @@ app = FastAPI()
 # ---------------------------------------------------------------------------
 # Model startup — loaded once, reused across requests
 # ---------------------------------------------------------------------------
-# buffalo_sc = MobileNet backbone (~100 MB) vs buffalo_l ResNet-100 (~1.2 GB)
-# Accuracy delta on real-world thumbnails is < 3% for cosine similarity.
 face_app = FaceAnalysis(name="buffalo_sc", providers=["CPUExecutionProvider"])
 face_app.prepare(ctx_id=-1)
 
-# RapidOCR: pure ONNX, no PyTorch/TF, supports ₹ via its det+rec pipeline
 ocr_engine = RapidOCR()
 
-# Lazy-load FER so the import doesn't slow cold start when mood isn't needed
-_fer_detector = None
+# DeepFace lazy-loaded on first mood call (avoids slow import at cold start)
+_deepface_ready = False
 
 
-def _get_fer():
-    global _fer_detector
-    if _fer_detector is None:
-        from fer import FER  # pip install fer  (ONNX-based, no TF required)
+def _ensure_deepface():
+    global _deepface_ready
+    if not _deepface_ready:
+        from deepface import DeepFace  # noqa: F401
 
-        _fer_detector = FER(mtcnn=False)  # mtcnn=False → OpenCV detector, faster
-    return _fer_detector
+        _deepface_ready = True
 
 
 # ---------------------------------------------------------------------------
@@ -50,7 +46,6 @@ class TrustRequest(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
-# Reuse a single TCP session across all image downloads
 _http_session = requests.Session()
 _http_session.headers.update({"User-Agent": "trust-score-service/2.0"})
 
@@ -59,6 +54,11 @@ def clean_score(score):
     if score is None or math.isnan(score) or math.isinf(score):
         return 0.0
     return float(score)
+
+
+def fmt_pct(score: float) -> str:
+    """Format a 0-1 score as a clean percentage string, e.g. '80.8%'."""
+    return f"{round(score * 100, 1)}%"
 
 
 def sanitize(obj):
@@ -86,7 +86,7 @@ def load_image(url: str) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Face similarity  (InsightFace buffalo_sc)
+# Face similarity
 # ---------------------------------------------------------------------------
 
 
@@ -108,7 +108,7 @@ def face_similarity(stream_img: np.ndarray, thumb_img: np.ndarray) -> float:
 
 
 # ---------------------------------------------------------------------------
-# OCR + contact extraction  (RapidOCR → no EasyOCR / no PyTorch)
+# OCR + contact extraction
 # ---------------------------------------------------------------------------
 
 _RUPEE_ALIASES = re.compile(r"\b(Rs\.?|INR|\bR\b)")
@@ -170,7 +170,7 @@ def extract_contacts(text: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Vibrancy  (unchanged — pure NumPy/OpenCV, already lightweight)
+# Vibrancy
 # ---------------------------------------------------------------------------
 
 
@@ -196,10 +196,10 @@ def vibrancy_score(img: np.ndarray) -> tuple[float, dict]:
 
 
 # ---------------------------------------------------------------------------
-# Mood  (FER ONNX — replaces DeepFace / TensorFlow)
+# Mood  (DeepFace, opencv backend — no moviepy / no dlib / no MTCNN)
 # ---------------------------------------------------------------------------
 
-_WARM_WEIGHTS = {
+_MOOD_WEIGHTS = {
     "happy": 1.0,
     "surprise": 0.4,
     "neutral": 0.1,
@@ -211,6 +211,7 @@ _WARM_WEIGHTS = {
 
 
 def _warm_color_mood(img: np.ndarray) -> float:
+    """Fallback: warm-hued pixel ratio as a rough positivity proxy."""
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     h = hsv[:, :, 0]
     warm_mask = ((h >= 0) & (h <= 35)) | ((h >= 160) & (h <= 179))
@@ -229,35 +230,50 @@ def _mood_label(score: float, fallback: bool) -> str:
 
 
 def mood_score(img: np.ndarray) -> tuple[float, str, list]:
+    """
+    DeepFace emotion analysis using the lightweight opencv detector backend.
+    actions=["emotion"] loads only the ~80 MB FER+ model — no moviepy, no dlib.
+    Falls back to warm-color heuristic if no face is detected.
+    """
     try:
-        detector = _get_fer()
-        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        detections = detector.detect_emotions(rgb)  # list of dicts
+        _ensure_deepface()
+        from deepface import DeepFace
 
-        if not detections:
-            raise ValueError("FER: no faces detected")
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        results = DeepFace.analyze(
+            img_path=rgb,
+            actions=["emotion"],
+            enforce_detection=False,
+            detector_backend="opencv",
+            silent=True,
+        )
+
+        if isinstance(results, dict):
+            results = [results]
 
         face_scores, breakdown = [], []
-        for det in detections:
-            emotions = det.get("emotions", {})
+        for face_result in results:
+            emotions = face_result.get("emotion", {})
             if not emotions:
                 continue
             total = sum(emotions.values()) or 1.0
             probs = {k: v / total for k, v in emotions.items()}
-            raw = sum(_WARM_WEIGHTS.get(e, 0.0) * p for e, p in probs.items())
+            raw = sum(_MOOD_WEIGHTS.get(e, 0.0) * p for e, p in probs.items())
             score = float((np.clip(raw, -1.0, 1.0) + 1.0) / 2.0)
             face_scores.append(score)
-            dominant = max(emotions, key=emotions.get)
+            dominant = face_result.get(
+                "dominant_emotion", max(emotions, key=emotions.get)
+            )
             breakdown.append(
                 {
-                    "dominant_emotion": dominant,
+                    "dominant_emotion": str(dominant),
                     "emotions": {k: round(float(v), 1) for k, v in emotions.items()},
                     "face_mood_score": round(score, 3),
                 }
             )
 
         if not face_scores:
-            raise ValueError("FER: no usable emotion data")
+            raise ValueError("DeepFace returned no usable emotion data")
 
         final = float(np.mean(face_scores))
         return clean_score(final), _mood_label(final, fallback=False), breakdown
@@ -284,7 +300,6 @@ def calculate_trust_score(data: TrustRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error loading images: {e}")
 
-    # Scores
     face_sc = clean_score(face_similarity(stream_img, thumb_img))
 
     thumb_text = extract_text(thumb_img)
@@ -311,21 +326,23 @@ def calculate_trust_score(data: TrustRequest):
     mood_sc = clean_score(mood_sc)
 
     # Weighted trust score (face=45%, contact=30%, mood=15%, vibrancy=10%)
-    trust_sc = 0.45 * face_sc + 0.30 * contact_sc + 0.15 * mood_sc + 0.10 * vib_sc
+    trust_sc = clean_score(
+        0.45 * face_sc + 0.30 * contact_sc + 0.15 * mood_sc + 0.10 * vib_sc
+    )
 
     return sanitize(
         {
-            "face_similarity": f"{round(face_sc, 3) * 100}%",
+            "face_similarity": fmt_pct(face_sc),
             "thumbnail_text": thumb_text,
-            "contact_similarity": f"{round(contact_sc, 3) * 100}%",
+            "contact_similarity": fmt_pct(contact_sc),
             "extracted_contacts": contacts,
             "matched_contacts": matched_contacts,
             "missing_contacts": missing_contacts,
-            "vibrancy_score": f"{round(vib_sc, 3) * 100}%",
+            "vibrancy_score": fmt_pct(vib_sc),
             "vibrancy_details": vibrancy_details,
-            "mood_score": f"{round(mood_sc, 3) * 100}%",
+            "mood_score": fmt_pct(mood_sc),
             "mood_label": mood_label,
             "emotion_breakdown": emotion_breakdown,
-            "trust_score": f"{round(clean_score(trust_sc), 3) * 100}%",
+            "trust_score": fmt_pct(trust_sc),
         }
     )
