@@ -1,0 +1,20 @@
+services:
+  trust-score:
+    build: .
+    image: trust-score:latest
+    ports:
+      - "8000:8000"
+    environment:
+      OMP_NUM_THREADS: "2"
+      OPENBLAS_NUM_THREADS: "2"
+    # Optional: persist InsightFace model cache across rebuilds
+    volumes:
+      - insightface_cache:/root/.insightface
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1.5G # comfortable headroom; peaks ~900 MB under load
+
+volumes:
+  insightface_cache:
